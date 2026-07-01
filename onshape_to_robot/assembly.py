@@ -429,12 +429,52 @@ class Assembly:
             ]
         )
 
+    def find_split_instances(self):
+        """
+        Find subassembly instances that a ``dof_`` mate reaches *inside*.
+
+        A body is normally identified by the top-level instance an occurrence
+        belongs to, so a whole subassembly is one rigid body. When a ``dof_``
+        mate connects two parts that live inside the same subassembly instance,
+        that subassembly must instead be split into several bodies. Such
+        instances are recorded here so :meth:`body_key` keys their occurrences
+        by full path rather than by the (shared) top-level instance.
+        """
+        self.split_instances: set = set()
+        for feature in self.assembly_data["rootAssembly"]["features"]:
+            if feature["featureType"] != "mate" or feature.get("suppressed", False):
+                continue
+            data = feature["featureData"]
+            if not data["name"].startswith("dof_"):
+                continue
+            path_a = data["matedEntities"][0]["matedOccurrence"]
+            path_b = data["matedEntities"][1]["matedOccurrence"]
+            # Only an *internal* dof splits a subassembly: both ends under the
+            # same top-level instance, at least one descending into it. A dof
+            # that merely crosses a subassembly boundary leaves it rigid.
+            if path_a and path_b and path_a[0] == path_b[0] and max(len(path_a), len(path_b)) > 1:
+                self.split_instances.add(path_a[0])
+
+    def body_key(self, occurrence: list):
+        """
+        Key identifying the rigid body an occurrence belongs to.
+
+        Normally the top-level instance id (a subassembly is one rigid body).
+        For a subassembly split by an internal ``dof_`` mate, the full
+        occurrence path is used so its parts resolve to distinct bodies.
+        """
+        if occurrence and occurrence[0] in self.split_instances:
+            return tuple(occurrence)
+        return occurrence[0]
+
     def process_mates(self):
         """
         Pre-assign all top-level instances to a separate body id
         """
+        self.find_split_instances()
         top_level_instances = self.assembly_data["rootAssembly"]["instances"]
-        self.make_body(top_level_instances[0]["id"])
+        if top_level_instances[0]["id"] not in self.split_instances:
+            self.make_body(top_level_instances[0]["id"])
 
         # We first search for DOFs
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
@@ -568,10 +608,27 @@ class Assembly:
                 else:
                     self.instance_body[child] = INSTANCE_IGNORE
 
-        # Checking that all intances are assigned to a body
+        # Checking that all intances are assigned to a body. A split
+        # subassembly gets no body of its own; its parts are keyed by full path
+        # and assigned below from their occurrences.
         for instance in self.assembly_data["rootAssembly"]["instances"]:
-            if instance["id"] not in self.instance_body and not instance["suppressed"]:
+            if (
+                instance["id"] not in self.instance_body
+                and not instance["suppressed"]
+                and instance["id"] not in self.split_instances
+            ):
                 self.make_body(instance["id"])
+
+        # Assign any not-yet-bodied part occurrences inside split subassemblies.
+        for path, occurrence in self.occurrences.items():
+            instance = occurrence.get("instance")
+            if (
+                path[0] in self.split_instances
+                and instance is not None
+                and instance.get("type") == "Part"
+                and path not in self.instance_body
+            ):
+                self.make_body(path)
 
         # Processing loop closing frames
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
@@ -717,8 +774,8 @@ class Assembly:
                 ):
                     continue
 
-                occurrence_A = data["matedEntities"][0]["matedOccurrence"][0]
-                occurrence_B = data["matedEntities"][1]["matedOccurrence"][0]
+                occurrence_A = self.body_key(data["matedEntities"][0]["matedOccurrence"])
+                occurrence_B = self.body_key(data["matedEntities"][1]["matedOccurrence"])
 
                 yield data, occurrence_A, occurrence_B
 
@@ -734,7 +791,7 @@ class Assembly:
                 data = feature["featureData"]
 
                 for occurrence in data["occurrences"]:
-                    group.append(occurrence["occurrence"][0])
+                    group.append(self.body_key(occurrence["occurrence"]))
             groups.append(group)
 
         return groups
@@ -922,6 +979,16 @@ class Assembly:
             ):
                 return instance
 
+        # Split subassemblies key their parts by full occurrence path; find the
+        # first such occurrence's instance.
+        for path, occurrence in self.occurrences.items():
+            if (
+                path in self.instance_body
+                and self.instance_body[path] == body_id
+                and occurrence.get("instance") is not None
+            ):
+                return occurrence["instance"]
+
         return None
 
     def body_occurrences(self, body_id: int):
@@ -929,7 +996,7 @@ class Assembly:
         Retrieve all occurrences associated to a given body id
         """
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
-            key = occurrence["path"][0]
+            key = self.body_key(occurrence["path"])
             if key in self.instance_body and self.instance_body[key] == body_id:
                 yield occurrence
 
